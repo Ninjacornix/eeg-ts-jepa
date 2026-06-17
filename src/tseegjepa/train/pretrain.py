@@ -19,13 +19,39 @@ from ..jepa import EEGJepa
 
 
 def pick_device(prefer: str = "auto") -> torch.device:
-    if prefer != "auto":
-        return torch.device(prefer)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    """Resolve a device. 'auto' picks cuda > mps > cpu.
+
+    Explicit choices ('cuda', 'cuda:1', 'mps', 'cpu') are honored but validated:
+    if the requested accelerator is unavailable we warn and fall back to cpu
+    instead of crashing mid-run.
+    """
+    def _available(kind: str) -> bool:
+        if kind == "cuda":
+            return torch.cuda.is_available()
+        if kind == "mps":
+            return getattr(torch.backends, "mps", None) is not None \
+                and torch.backends.mps.is_available()
+        return True  # cpu
+
+    if prefer == "auto":
+        if torch.cuda.is_available():
+            dev = torch.device("cuda")
+        elif _available("mps"):
+            dev = torch.device("mps")
+        else:
+            dev = torch.device("cpu")
+    else:
+        dev = torch.device(prefer)
+        if not _available(dev.type):
+            print(f"[device] {prefer!r} unavailable -> falling back to cpu")
+            dev = torch.device("cpu")
+
+    if dev.type == "cuda":
+        idx = dev.index or 0
+        print(f"[device] cuda:{idx} ({torch.cuda.get_device_name(idx)})")
+    else:
+        print(f"[device] {dev.type}")
+    return dev
 
 
 def build_pretrain_loader(cfg: PretrainConfig, n_sites: int = 4,

@@ -1,0 +1,15 @@
+# Core model + training (minimum to import tseegjepa and pretrain/probe)
+torch>=2.2
+numpy>=1.24
+
+# Real EEG data via MOABB (datasets, paradigms) + MNE (montages, demographics)
+moabb>=1.5
+mne>=1.5
+
+# Data inspection / baselines / clustering (inspect_data.py, raw baselines, CSP)
+scipy>=1.10
+scikit-learn>=1.3
+pandas>=2.0
+
+# Figures (visualize_data.py); optional for training
+matplotlib>=3.7
