@@ -1,0 +1,5 @@
+torch>=2.2
+numpy>=1.24
+
+[viz]
+matplotlib>=3.7

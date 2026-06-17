@@ -1,0 +1,26 @@
+[project]
+name = "tseegjepa"
+version = "0.1.0"
+description = "Multi-scale, hardware-agnostic EEG foundation model trained with a Joint-Embedding Predictive Architecture (JEPA)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.7"]
+moabb = ["moabb>=1.0", "mne>=1.5"]
+
+[project.scripts]
+tseegjepa-pretrain = "tseegjepa.train.pretrain:main"
+tseegjepa-probe = "tseegjepa.train.linear_probe:main"
+tseegjepa-eval = "tseegjepa.eval.loocv:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

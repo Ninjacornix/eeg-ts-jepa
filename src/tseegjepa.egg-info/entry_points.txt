@@ -1,0 +1,4 @@
+[console_scripts]
+tseegjepa-eval = tseegjepa.eval.loocv:main
+tseegjepa-pretrain = tseegjepa.train.pretrain:main
+tseegjepa-probe = tseegjepa.train.linear_probe:main
