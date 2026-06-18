@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Model checkpoints / artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Generated figures / outputs
+figs/
+figs_*/
+out/
+outputs/
+
+# Data caches (MOABB/MNE download here by default)
+mne_data/
+*.edf
+*.mat
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

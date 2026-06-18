@@ -19,8 +19,13 @@ only — no raw-signal reconstruction.
   (spatial-block × variable-duration temporal target blocks), a predictor
   forecasts the **latent embeddings** of the masked targets, and an **EMA target
   encoder (stop-gradient)** produces those targets from the unmasked view.
-- **Collapse monitoring.** Embedding std + effective rank logged each interval;
-  warns on low variance/rank.
+- **Hierarchical variant** (`jepa_hier.py`). A temporal pyramid: a single mask
+  at the finest level propagated upward, with a predictor + EMA target + VICReg
+  per level, so abstraction is learned at multiple scales (micro-dynamics →
+  rhythms → trial state). Same interface as the flat model.
+- **Anti-collapse.** Embedding std + effective-rank monitored each step; VICReg
+  variance + covariance terms on the encoder output keep variance up and dims
+  decorrelated (covariance term is what stops rank collapse).
 - **Cross-site generalization.** Diverse multi-site pretraining + optional
   DANN-style domain-invariance objective (gradient reversal).
 - **Downstream.** Freeze the encoder → linear probe, or fine-tune. Evaluated
@@ -41,10 +46,18 @@ src/tseegjepa/
   jepa.py            EEGJepa: tokenizer + context/EMA-target encoders + predictor + loss
   collapse.py        embedding-variance / effective-rank diagnostics
   domain.py          gradient-reversal domain-invariance head
-  data/              montages (10-20) + synthetic multi-site EEG
-  train/             pretrain loop + linear-probe / fine-tune
+  jepa_hier.py       HierarchicalEEGJepa: temporal pyramid, per-level prediction
+  data/              montages (10-20), synthetic EEG, MOABB adapter + electrodes
+    moabb_eeg.py       MOABB -> batch schema; demographics; crop/align
+    electrodes.py      global standard_1020 registry (ids + scalp coords)
+  train/             pretrain loop + linear-probe / fine-tune / raw baseline
   eval/              leave-one-dataset-out + corruption stress tests
-scripts/smoke_test.py   full end-to-end run (< 1 min, CPU)
+scripts/
+  smoke_test.py      full synthetic end-to-end run (< 1 min, CPU)
+  experiment.py      subject-disjoint cohort protocol + multi-dataset SSL (main)
+  train_moabb.py     single-dataset MOABB pretrain + probe / LODO
+  inspect_data.py    dataset EDA: balance, band-power, lateralization, ceilings
+  visualize_data.py  figures: PSD, topomaps, band-power heatmap, embeddings
 ```
 
 ## Quickstart
@@ -88,6 +101,52 @@ one trial = one sample, `domain` = subject (the leave-one-subject-out axis),
 are dropped, so a model pretrained on one dataset accepts any other montage.
 Default `BNCI2014_001` = 22 EEG channels, 4 motor-imagery classes, 9 subjects;
 pass `--dataset`/`--paradigm`/`--n-classes` for others.
+
+## Subject-disjoint experiments (`scripts/experiment.py`)
+
+The main protocol. People are split into disjoint **train / val / test** groups
+(no subject in two splits). The encoder is pretrained self-supervised on train
+people, monitored on val people (JEPA loss + collapse), and each test person is
+**calibrated** (a personal probe fit on their own data) and scored on their own
+held-out data — the realistic per-person deployment setting, not a cross-subject
+zero-shot claim.
+
+```bash
+# whole-dataset shared encoder, 70/15/15 subject split
+python scripts/experiment.py --dataset Dreyer2023 --n-subjects 87 \
+  --split 0.7 0.15 0.15 --pool chan --raw-baseline --device cuda --amp
+
+# demographic cohorts: each cohort trained+validated+tested within itself
+python scripts/experiment.py --dataset Dreyer2023 --cohort-by sex age ...
+
+# multi-dataset SSL: pool extra datasets into pretraining (labels ignored),
+# eval stays on --dataset; trials cropped+aligned to a common MI window
+python scripts/experiment.py --dataset Dreyer2023 --n-subjects 87 \
+  --pretrain-extra PhysionetMI:109 BNCI2014_001:9 Schirrmeister2017 \
+  --crop-align end --finetune ...
+```
+
+Key flags: `--cohort-by sex|age` (demographic cohorts), `--hierarchical`
+(pyramid model), `--finetune` (unfreeze encoder per subject), `--pretrain-extra`
+(multi-dataset SSL pool), `--mask-frac` / `--dropout` (harder pretext / regular-
+ization), `--crop-align end|center|start`, `--amp` (bf16), `--lr` / `--warmup-
+epochs`, `--device cuda|mps|cpu`. `--raw-baseline` prints a per-subject
+log-bandpower ceiling next to each result. Demographics (sex/age) are read from
+MOABB metadata where available (e.g. Dreyer2023, BNCI2014_001); PhysioNet has
+none.
+
+## Inspect & visualize data
+
+```bash
+python scripts/inspect_data.py  --dataset Dreyer2023 --subjects 1 2 3   # EDA + ceilings
+python scripts/visualize_data.py --dataset PhysionetMI --subjects 1 --tsne --out figs
+```
+
+`inspect_data.py` reports class balance, per-channel band-power by class,
+C3/C4 lateralization, demographics, and difficulty ceilings (log-bandpower
+logistic regression + CSP+LDA). `visualize_data.py` saves raw traces, class-mean
+PSD, band-power heatmaps, per-band scalp **topomaps**, lateralization bars, and
+PCA/t-SNE trial embeddings.
 
 ## Using your own EEG
 

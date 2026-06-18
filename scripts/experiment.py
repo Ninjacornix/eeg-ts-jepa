@@ -34,12 +34,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from tseegjepa.config import PretrainConfig
 from tseegjepa.data import collate_variable_montage
 from tseegjepa.data.moabb_eeg import MoabbEEGDataset, load_moabb
 from tseegjepa.jepa import EEGJepa
+from tseegjepa.jepa_hier import HierarchicalEEGJepa
 from tseegjepa.train.linear_probe import fit_linear_probe, fit_raw_baseline
 from tseegjepa.train.pretrain import _ema_at, _lr_at, move, pick_device
 
@@ -90,6 +91,51 @@ def cohort_labels(subjects, demo, cohort_by):
     return {s: part(s) for s in subjects}
 
 
+def load_extra_datasets(specs, paradigm, sample_rate, norm):
+    """Load extra MOABB datasets (NAME[:N]) as MoabbEEGDatasets for SSL pooling.
+
+    Loaded PER SUBJECT and resilient: a subject that fails to download (network
+    timeout, corrupt run, channel mismatch) is skipped, keeping the ones that
+    succeeded. One flaky source/subject must not kill a multi-hour run.
+    """
+    import moabb.datasets as MD
+    out = []
+    for spec in specs:
+        name, _, n = spec.partition(":")
+        try:
+            subs = (list(range(1, int(n) + 1)) if n
+                    else list(getattr(MD, name)().subject_list))
+        except Exception as e:
+            print(f"  [skip dataset] {name}: {repr(e)[:100]}")
+            continue
+        print(f"  loading extra SSL dataset {name} ({len(subs)} subjects) ...")
+        Xs, ys, metas, chn, ok = [], [], [], None, 0
+        for s in subs:
+            try:
+                X, y, meta, ch_names, _ = load_moabb(
+                    name, subjects=[s], paradigm_name=paradigm,
+                    sample_rate=sample_rate)
+            except Exception as e:
+                print(f"    [skip {name} s{s}] {repr(e)[:80]}")
+                continue
+            if chn is None:
+                chn = ch_names
+            if ch_names != chn:                      # montage differs -> skip subject
+                print(f"    [skip {name} s{s}] channel mismatch")
+                continue
+            Xs.append(X); ys.append(y); metas += meta; ok += 1
+        if not Xs:
+            print(f"  [skip dataset] {name}: no subjects loaded")
+            continue
+        import numpy as np
+        X = np.concatenate(Xs, 0); y = np.concatenate(ys, 0)
+        ds = MoabbEEGDataset(X, y, metas, chn, norm=norm)
+        print(f"    {name}: {ok}/{len(subs)} subjects, trials={len(ds)} "
+              f"ch={len(chn)} T={X.shape[-1]}")
+        out.append(ds)
+    return out
+
+
 def split_within(subjects, ratios, seed):
     """Disjoint train/val/test split WITHIN a set of subjects (no leakage)."""
     rng = np.random.default_rng(seed)
@@ -99,23 +145,35 @@ def split_within(subjects, ratios, seed):
 
 
 # --------------------------- pretraining ----------------------------------
+def _amp_ctx(amp, device):
+    """bf16 autocast on cuda (halves activation memory, ~2x faster); else no-op."""
+    import contextlib
+    if amp and device.type == "cuda":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 @torch.no_grad()
-def jepa_eval(model, ds, cfg, device, gen):
+def jepa_eval(model, ds, cfg, device, gen, amp=False, workers=0):
     """Mean JEPA pred-loss + collapse on an unseen (val) subject group."""
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False,
-                        collate_fn=collate_variable_montage)
+                        collate_fn=collate_variable_montage,
+                        num_workers=workers, pin_memory=(device.type == "cuda"))
     model.eval()
     tot, nb, last = 0.0, 0, None
     for b in loader:
-        out = model(move(b, device), generator=gen)
+        with _amp_ctx(amp, device):
+            out = model(move(b, device), generator=gen)
         tot += float(out["loss_pred"]); nb += 1; last = out
     cs = model.collapse_report(last) if last is not None else None
     return (tot / max(1, nb)), cs
 
 
-def pretrain(model, train_ds, val_ds, cfg, device):
+def pretrain(model, train_ds, val_ds, cfg, device, amp=False, workers=0):
     loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                        drop_last=True, collate_fn=collate_variable_montage)
+                        drop_last=True, collate_fn=collate_variable_montage,
+                        num_workers=workers, pin_memory=(device.type == "cuda"),
+                        persistent_workers=(workers > 0))
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
     gen = torch.Generator().manual_seed(cfg.seed)
@@ -129,12 +187,13 @@ def pretrain(model, train_ds, val_ds, cfg, device):
             b = move(b, device)
             for g in opt.param_groups:
                 g["lr"] = _lr_at(step, total, warm, cfg.lr)
-            out = model(b, generator=gen)
+            with _amp_ctx(amp, device):
+                out = model(b, generator=gen)
             opt.zero_grad(set_to_none=True); out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip); opt.step()
             model.update_target(_ema_at(step, total, cfg.ema_base, cfg.ema_final))
             run += float(out["loss"].detach()); step += 1
-        vloss, vcs = jepa_eval(model, val_ds, cfg, device, gen)
+        vloss, vcs = jepa_eval(model, val_ds, cfg, device, gen, amp, workers)
         best_val = min(best_val, vloss)
         print(f"  ep{ep:02d} train_loss={run/len(loader):.4f}  "
               f"val_pred={vloss:.4f} | val {vcs}")
@@ -164,7 +223,7 @@ def _calib_eval_split(ho: MoabbEEGDataset, calib_frac, seed):
 
 
 def calibrate_per_subject(model, full, subjects, n_cls, device, pool,
-                          calib_frac=0.5, raw=False):
+                          calib_frac=0.5, raw=False, finetune=False):
     """For each NEW person: calibrate a personal probe, score their held-out data.
 
     Encoder is frozen (shared, pretrained). Only the per-subject linear probe is
@@ -177,7 +236,8 @@ def calibrate_per_subject(model, full, subjects, n_cls, device, pool,
         if len(ho) < 12:
             continue
         cal, ev = _calib_eval_split(ho, calib_frac, seed=s)
-        res = fit_linear_probe(model, cal, ev, n_cls, device, pool=pool)
+        res = fit_linear_probe(model, cal, ev, n_cls, device, pool=pool,
+                               finetune=finetune)
         accs.append(res["accuracy"])
         line = (f"  subj {s:>3d}: calib={len(cal):>3d} eval={len(ev):>3d}  "
                 f"acc={res['accuracy']:.3f} bal={res['balanced_accuracy']:.3f}")
@@ -198,9 +258,17 @@ def build_cfg(a, n_train) -> PretrainConfig:
     cfg.model.sample_rate = a.sample_rate
     cfg.model.patch_ms = a.patch_ms
     cfg.model.dim = a.dim; cfg.model.heads = a.heads; cfg.model.depth = a.depth
+    cfg.model.dropout = a.dropout
+    if a.mask_frac is not None:                  # harder pretext -> richer features
+        cfg.mask.temporal_mask_frac = a.mask_frac
+        cfg.mask.spatial_block_frac = a.mask_frac
+    if a.n_target_blocks is not None:
+        cfg.mask.n_target_blocks = a.n_target_blocks
     assert a.dim % a.heads == 0, "dim % heads != 0"
     cfg.epochs = a.epochs; cfg.batch_size = a.batch_size
-    cfg.warmup_epochs = max(1, a.epochs // 10); cfg.seed = a.seed
+    cfg.warmup_epochs = a.warmup_epochs if a.warmup_epochs is not None \
+        else max(1, a.epochs // 10)
+    cfg.lr = a.lr; cfg.seed = a.seed
     cfg.n_domains = n_train
     return cfg
 
@@ -228,18 +296,57 @@ def main():
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1.5e-3, help="peak learning rate")
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="encoder dropout; raise (0.1-0.2) to fight train-subject "
+                        "overfitting (the train/val SSL-loss gap)")
+    p.add_argument("--mask-frac", type=float, default=None,
+                   help="fraction masked (temporal+spatial). Higher = harder pretext "
+                        "= richer, less subject-specific features. default 0.5")
+    p.add_argument("--n-target-blocks", type=int, default=None,
+                   help="number of JEPA target blocks (default 4); more = harder")
+    p.add_argument("--warmup-epochs", type=int, default=None,
+                   help="LR warmup epochs (default: epochs//10). Raise to avoid the "
+                        "post-warmup collapse spike on large SSL pools")
     p.add_argument("--pool", default="chan", choices=["mean", "chan"])
     p.add_argument("--norm", default="global", choices=["global", "perchan", "none"])
     p.add_argument("--calib-frac", type=float, default=0.5,
                    help="fraction of a new subject's data used to calibrate their "
                         "personal probe (ignored if subject has >=2 sessions)")
+    p.add_argument("--pretrain-extra", nargs="*", default=[],
+                   help="extra MOABB datasets pooled into SSL pretraining only "
+                        "(labels ignored). Format NAME[:N]. e.g. PhysionetMI:40 "
+                        "BNCI2014_001:9 . Downstream eval stays on --dataset.")
+    p.add_argument("--pretrain-seconds", type=float, default=None,
+                   help="crop all pretraining trials to this length (default: min "
+                        "trial length across primary+extra datasets)")
+    p.add_argument("--crop-align", default="end", choices=["end", "center", "start"],
+                   help="which part of each trial to keep when cropping the SSL pool. "
+                        "'end' = sustained MI (aligns datasets with different cue "
+                        "offsets, e.g. IV-2a [2,6] vs Dreyer [0,5])")
     p.add_argument("--raw-baseline", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto")
+    p.add_argument("--hierarchical", action="store_true",
+                   help="use Hierarchical EEG-JEPA (temporal pyramid, per-level "
+                        "prediction) instead of the flat model")
+    p.add_argument("--levels", type=int, default=3, help="hierarchy levels")
+    p.add_argument("--pool-factor", type=int, default=2,
+                   help="temporal pooling factor between hierarchy levels")
+    p.add_argument("--finetune", action="store_true",
+                   help="per-subject calibration unfreezes the encoder (fine-tune) "
+                        "instead of frozen linear probe")
+    p.add_argument("--amp", action="store_true",
+                   help="bf16 autocast on cuda: ~halves activation memory, ~2x faster")
+    p.add_argument("--workers", type=int, default=0,
+                   help="DataLoader worker processes (keep the GPU fed)")
     p.add_argument("--save", default=None,
                    help="save per-cohort encoders (suffixed with the cohort label)")
     a = p.parse_args()
     device = pick_device(a.device)
+    if a.finetune and a.hierarchical:
+        print("[warn] --finetune not supported with --hierarchical -> frozen probe")
+        a.finetune = False
 
     if a.subjects:
         subjects = a.subjects
@@ -259,6 +366,18 @@ def main():
     # demographics from the loaded meta (Dreyer2023/BNCI carry sex+age)
     demo = {m["subject"]: {"sex": m.get("sex", "U"), "age": m.get("age")}
             for m in meta}
+
+    # extra datasets for SSL pretraining (labels ignored); crop all to common T
+    extras = load_extra_datasets(a.pretrain_extra, a.paradigm, a.sample_rate, a.norm)
+    if extras:
+        lengths = [X.shape[-1]] + [e.X.shape[-1] for e in extras]
+        common_t = (int(a.pretrain_seconds * a.sample_rate)
+                    if a.pretrain_seconds else min(lengths))
+        extras = [e.with_crop(common_t, a.crop_align) for e in extras]
+        print(f"  multi-dataset SSL: +{len(extras)} datasets, crop to {common_t} "
+              f"samples ({common_t/a.sample_rate:.2f}s, align={a.crop_align})")
+    else:
+        common_t = None
 
     # build cohorts (each handled fully intra-group)
     labels = cohort_labels(subjects, demo, a.cohort_by)
@@ -290,14 +409,28 @@ def main():
             print("  skip: empty test split"); continue
 
         cfg = build_cfg(a, len(train_s))
-        model = EEGJepa(cfg).to(device)
-        print(f"  == pretrain on {cohort} train / monitor {cohort} val ==")
-        pretrain(model, full.subset_by_subject(train_s),
-                 full.subset_by_subject(val_s), cfg, device)
+        if a.hierarchical:
+            model = HierarchicalEEGJepa(cfg, n_levels=a.levels,
+                                        pool_factor=a.pool_factor).to(device)
+        else:
+            model = EEGJepa(cfg).to(device)
+        # SSL pretraining pool = cohort train subjects (+ extra datasets, cropped)
+        train_primary = full.subset_by_subject(train_s)
+        if extras:
+            train_pool = ConcatDataset(
+                [train_primary.with_crop(common_t, a.crop_align)] + extras)
+            print(f"  SSL pool: {len(train_primary)} primary + "
+                  f"{sum(len(e) for e in extras)} extra = {len(train_pool)} trials")
+        else:
+            train_pool = train_primary
+        print(f"  == pretrain on {cohort} train / monitor {cohort} val "
+              f"({'hierarchical' if a.hierarchical else 'flat'}) ==")
+        pretrain(model, train_pool, full.subset_by_subject(val_s), cfg, device,
+                 amp=a.amp, workers=a.workers)
 
         print(f"  == {cohort} TEST: per-subject calibration ==")
         tres = calibrate_per_subject(model, full, test_s, n_cls, device, a.pool,
-                                     a.calib_frac, a.raw_baseline)
+                                     a.calib_frac, a.raw_baseline, a.finetune)
         print(f"  COHORT {cohort} acc = {tres['acc_mean']:.3f} +- "
               f"{tres['acc_std']:.3f} (n={tres['n']}, chance={1/n_cls:.3f})")
         summary[cohort] = tres

@@ -177,7 +177,8 @@ class MoabbEEGDataset(Dataset):
     """
 
     def __init__(self, X, y, meta, ch_names, norm: str = "global",
-                 subgroup_by: str = "sex", standardize: bool | None = None):
+                 subgroup_by: str = "sex", crop_t: int | None = None,
+                 crop_align: str = "end", standardize: bool | None = None):
         self.X = X
         self.y = y
         self.meta = meta
@@ -189,6 +190,12 @@ class MoabbEEGDataset(Dataset):
             norm = "none"
         self.norm = norm
         self.subgroup_by = subgroup_by
+        # crop every trial to crop_t samples -> uniform T for multi-dataset batches.
+        # crop_align: 'end' = keep the LAST crop_t samples (sustained MI, past the
+        # cue-onset transient -> aligns datasets with different cue offsets, e.g.
+        # IV-2a [2,6] vs Dreyer [0,5]); 'start' = first; 'center' = middle.
+        self.crop_t = crop_t
+        self.crop_align = crop_align
         subs = sorted({m["subject"] for m in meta})
         self._sub_lut = {s: i for i, s in enumerate(subs)}
         self._build_subgroups()
@@ -224,6 +231,14 @@ class MoabbEEGDataset(Dataset):
 
     def __getitem__(self, idx):
         x = torch.from_numpy(self.X[idx])                  # (C, T)
+        if self.crop_t is not None and x.shape[1] > self.crop_t:
+            if self.crop_align == "end":
+                x = x[:, -self.crop_t:]
+            elif self.crop_align == "center":
+                s = (x.shape[1] - self.crop_t) // 2
+                x = x[:, s:s + self.crop_t]
+            else:                                          # "start"
+                x = x[:, : self.crop_t]
         if self.norm == "global":
             x = (x - x.mean()) / (x.std() + 1e-8)          # keep inter-channel power
         elif self.norm == "perchan":
@@ -244,4 +259,10 @@ class MoabbEEGDataset(Dataset):
         return MoabbEEGDataset(self.X[idx], self.y[idx],
                                [self.meta[i] for i in idx],
                                self.ch_names, norm=self.norm,
-                               subgroup_by=self.subgroup_by)
+                               subgroup_by=self.subgroup_by, crop_t=self.crop_t,
+                               crop_align=self.crop_align)
+
+    def with_crop(self, crop_t: int | None, crop_align: str = "end") -> "MoabbEEGDataset":
+        return MoabbEEGDataset(self.X, self.y, self.meta, self.ch_names,
+                               norm=self.norm, subgroup_by=self.subgroup_by,
+                               crop_t=crop_t, crop_align=crop_align)
