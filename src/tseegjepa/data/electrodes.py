@@ -45,20 +45,37 @@ def vocab_size() -> int:
     return len(_registry()[0])
 
 
-def channel_ids(names: list[str]) -> np.ndarray:
+def unknown_id() -> int:
+    """Stable identity used when a name is outside the standard registry."""
+    return vocab_size()
+
+
+def channel_ids(names: list[str], strict: bool = True) -> np.ndarray:
     _, name_to_id, _ = _registry()
     out = []
     for n in names:
         key = _clean(n)
         if key not in name_to_id:
-            raise KeyError(f"electrode {n!r} (->{key}) not in standard_1020 registry")
-        out.append(name_to_id[key])
+            if strict:
+                raise KeyError(f"electrode {n!r} (->{key}) not in standard_1020 registry")
+            out.append(unknown_id())
+        else:
+            out.append(name_to_id[key])
     return np.asarray(out, dtype=np.int64)
 
 
-def channel_positions(names: list[str]) -> np.ndarray:
+def channel_positions(names: list[str], strict: bool = True) -> np.ndarray:
     _, name_to_id, xyz = _registry()
-    return np.stack([xyz[name_to_id[_clean(n)]] for n in names]).astype(np.float32)
+    out = []
+    for n in names:
+        key = _clean(n)
+        if key not in name_to_id:
+            if strict:
+                raise KeyError(f"electrode {n!r} (->{key}) not in standard_1020 registry")
+            out.append(np.zeros(3, dtype=np.float32))
+        else:
+            out.append(xyz[name_to_id[key]])
+    return np.stack(out).astype(np.float32)
 
 
 def known(names: list[str]) -> list[bool]:

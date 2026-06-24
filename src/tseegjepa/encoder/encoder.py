@@ -12,19 +12,24 @@ import torch
 import torch.nn as nn
 
 from ..config import ModelConfig
-from .attention import BranchMHA, build_branch_masks
+from .attention import BranchMHA
 
 
 class MultiScaleBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig, n_branches: int):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.n_branches = n_branches
+        self.cfg = cfg
+        self.n_branches = len(cfg.temporal_windows) + int(cfg.use_spatial_branch)
         self.norm1 = nn.LayerNorm(cfg.dim)
-        self.branches = nn.ModuleList(
-            [BranchMHA(cfg.dim, cfg.heads, cfg.dropout) for _ in range(n_branches)]
+        self.temporal = nn.ModuleList(
+            [BranchMHA(cfg.dim, cfg.heads, cfg.dropout) for _ in cfg.temporal_windows]
+        )
+        self.spatial = (
+            BranchMHA(cfg.dim, cfg.heads, cfg.dropout)
+            if cfg.use_spatial_branch else None
         )
         # fuse parallel branch outputs -> single latent
-        self.fuse = nn.Linear(n_branches * cfg.dim, cfg.dim)
+        self.fuse = nn.Linear(self.n_branches * cfg.dim, cfg.dim)
         self.norm2 = nn.LayerNorm(cfg.dim)
         hidden = int(cfg.dim * cfg.mlp_ratio)
         self.mlp = nn.Sequential(
@@ -32,27 +37,39 @@ class MultiScaleBlock(nn.Module):
             nn.Dropout(cfg.dropout), nn.Linear(hidden, cfg.dim),
         )
 
-    def forward(self, x: torch.Tensor, masks: list[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_mask: torch.Tensor,
+        ch_pos: torch.Tensor | None,
+        C: int,
+        T: int,
+    ) -> torch.Tensor:
         h = self.norm1(x)
-        outs = [branch(h, m) for branch, m in zip(self.branches, masks)]
+        outs = [
+            branch.temporal(h, token_mask, C, T, window)
+            for branch, window in zip(self.temporal, self.cfg.temporal_windows)
+        ]
+        if self.spatial is not None:
+            outs.append(
+                self.spatial.spatial(
+                    h, token_mask, ch_pos, C, T, self.cfg.spatial_k
+                )
+            )
         x = x + self.fuse(torch.cat(outs, dim=-1))
         x = x + self.mlp(self.norm2(x))
         return x
 
 
 class MultiScaleEncoder(nn.Module):
-    """Token-set encoder; operates on (B, M, D) tokens + index tensors.
-
-    Accepts an arbitrary (possibly masked / gathered) set of tokens, so the
-    same module serves as both the context encoder and the EMA target encoder.
-    """
+    """Factorized encoder over a padded, masked ``(channel, time)`` token grid."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
         self.n_branches = len(cfg.temporal_windows) + (1 if cfg.use_spatial_branch else 0)
         self.blocks = nn.ModuleList(
-            [MultiScaleBlock(cfg, self.n_branches) for _ in range(cfg.depth)]
+            [MultiScaleBlock(cfg) for _ in range(cfg.depth)]
         )
         self.norm = nn.LayerNorm(cfg.dim)
 
@@ -62,14 +79,16 @@ class MultiScaleEncoder(nn.Module):
         ch_index: torch.Tensor,     # (B, M)
         time_index: torch.Tensor,   # (B, M)
         token_mask: torch.Tensor,   # (B, M) True = valid
+        ch_pos: torch.Tensor | None = None,  # (B,C,3)
     ) -> torch.Tensor:
-        masks = build_branch_masks(
-            ch_index, time_index, token_mask,
-            self.cfg.temporal_windows, self.cfg.use_spatial_branch,
-        )
+        C = int(ch_index.max().item()) + 1
+        T = int(time_index.max().item()) + 1
+        x_tokens = tokens.shape[1]
+        if C * T != x_tokens:
+            raise ValueError(f"factorized encoder expected C*T={C*T}, got {x_tokens}")
         x = tokens
         for blk in self.blocks:
-            x = blk(x, masks)
+            x = blk(x, token_mask, ch_pos, C, T)
         return self.norm(x)
 
     @torch.no_grad()

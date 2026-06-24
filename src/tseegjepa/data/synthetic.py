@@ -116,28 +116,28 @@ class SyntheticEEGDataset(Dataset):
 
 
 def collate_variable_montage(batch: list[dict]) -> dict:
-    """Pad ragged channel/time dims and build a key-padding mask.
-
-    Returns tensors shaped (B, Cmax, T) etc. plus `ch_mask` (B, Cmax) True=valid.
-    Time length is assumed constant within a batch (fixed `seconds`).
-    """
+    """Pad ragged channel and time dimensions and build validity masks."""
     B = len(batch)
     Cmax = max(b["signal"].shape[0] for b in batch)
-    T = batch[0]["signal"].shape[1]
+    Tmax = max(b["signal"].shape[1] for b in batch)
 
-    signal = torch.zeros(B, Cmax, T)
+    signal = torch.zeros(B, Cmax, Tmax)
+    sample_mask = torch.zeros(B, Tmax, dtype=torch.bool)
     ch_ids = torch.zeros(B, Cmax, dtype=torch.long)
     ch_pos = torch.zeros(B, Cmax, 3)
     ch_mask = torch.zeros(B, Cmax, dtype=torch.bool)
     for i, b in enumerate(batch):
         c = b["signal"].shape[0]
-        signal[i, :c] = b["signal"]
+        t = b["signal"].shape[1]
+        signal[i, :c, :t] = b["signal"]
+        sample_mask[i, :t] = True
         ch_ids[i, :c] = b["ch_ids"]
         ch_pos[i, :c] = b["ch_pos"]
         ch_mask[i, :c] = True
 
     return {
         "signal": signal,
+        "sample_mask": sample_mask,
         "ch_ids": ch_ids,
         "ch_pos": ch_pos,
         "ch_mask": ch_mask,

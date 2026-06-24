@@ -13,6 +13,7 @@ seen during pretraining.
 from __future__ import annotations
 
 import argparse
+import copy
 
 import torch
 
@@ -20,7 +21,8 @@ from ..config import PretrainConfig
 from ..data import SyntheticEEGDataset
 from ..jepa import EEGJepa
 from ..train.linear_probe import fit_linear_probe
-from ..train.pretrain import pick_device, pretrain
+from ..train.engine import PretrainTrainer
+from ..train.pretrain import pick_device
 from .corruptions import CORRUPTIONS, CorruptedDataset
 
 
@@ -42,51 +44,33 @@ def leave_one_dataset_out(
 
     for held in range(n_sites):
         train_sites = [s for s in range(n_sites) if s != held]
-        cfg_h = cfg or PretrainConfig()
+        cfg_h = copy.deepcopy(cfg) if cfg is not None else PretrainConfig()
         cfg_h.epochs = pretrain_epochs
         cfg_h.model.patch_ms = max(cfg_h.model.patch_ms, 125.0)
 
         # pretrain on train sites only (remap ids 0..n-2)
         model = EEGJepa(cfg_h).to(device)
-        from torch.utils.data import ConcatDataset, DataLoader
-        from ..data import collate_variable_montage
-        from ..train.pretrain import _ema_at, _lr_at, move
+        from torch.utils.data import ConcatDataset
 
         ds = ConcatDataset([
             SyntheticEEGDataset(per_site, site_id=s, seed=s)
             for s in train_sites
         ])
-        loader = DataLoader(ds, batch_size=cfg_h.batch_size, shuffle=True,
-                            drop_last=True, collate_fn=collate_variable_montage)
-        params = [p for p in model.parameters() if p.requires_grad]
-        opt = torch.optim.AdamW(params, lr=cfg_h.lr, weight_decay=cfg_h.weight_decay)
-        gen = torch.Generator().manual_seed(held)
-        total = cfg_h.epochs * len(loader)
-        warm = cfg_h.warmup_epochs * len(loader)
-        step = 0
-        model.train()
-        for _ in range(cfg_h.epochs):
-            for batch in loader:
-                batch = move(batch, device)
-                for g in opt.param_groups:
-                    g["lr"] = _lr_at(step, total, warm, cfg_h.lr)
-                out = model(batch, generator=gen)
-                opt.zero_grad(set_to_none=True)
-                out["loss"].backward()
-                torch.nn.utils.clip_grad_norm_(params, cfg_h.grad_clip)
-                opt.step()
-                model.update_target(_ema_at(step, total, cfg_h.ema_base, cfg_h.ema_final))
-                step += 1
+        PretrainTrainer(model, cfg_h, device).fit(ds, verbose=False)
 
         # downstream on held-out site
         probe_tr = SyntheticEEGDataset(probe_n, site_id=held, seed=100 + held)
         probe_te = SyntheticEEGDataset(probe_n, site_id=held, seed=200 + held)
-        clean = fit_linear_probe(model, probe_tr, probe_te, n_classes, device)
+        clean = fit_linear_probe(
+            model, probe_tr, probe_te, n_classes, device, pool="spatial"
+        )
 
         corrupt = {}
         for name in corruptions:
             cte = CorruptedDataset(probe_te, name, severity=severity, seed=held)
-            r = fit_linear_probe(model, probe_tr, cte, n_classes, device)
+            r = fit_linear_probe(
+                model, probe_tr, cte, n_classes, device, pool="spatial"
+            )
             corrupt[name] = {
                 "accuracy": r["accuracy"],
                 "drop": clean["accuracy"] - r["accuracy"],

@@ -5,6 +5,8 @@ from .tokenizer import EEGTokenizer
 from .encoder import MultiScaleEncoder
 from .predictor import Predictor
 from .jepa import EEGJepa
+from .jepa_hier import HierarchicalEEGJepa
+from .pooling import SpatialAnchorPool
 
 __all__ = [
     "ModelConfig",
@@ -14,4 +16,6 @@ __all__ = [
     "MultiScaleEncoder",
     "Predictor",
     "EEGJepa",
+    "HierarchicalEEGJepa",
+    "SpatialAnchorPool",
 ]

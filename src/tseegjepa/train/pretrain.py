@@ -1,14 +1,13 @@
 """Self-supervised pretraining loop for EEG-JEPA.
 
 Multi-site synthetic data by default (diverse montages/devices) -> the model is
-pushed toward cross-site generalization.  Latent-space prediction loss, EMA
-target encoder, cosine LR + warmup, and periodic collapse monitoring.
+pushed toward cross-site generalization. Latent-space prediction loss, a full
+EMA target tower, cosine LR + warmup, and collapse-aware validation.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 
 import torch
 from torch.utils.data import ConcatDataset, DataLoader
@@ -16,42 +15,13 @@ from torch.utils.data import ConcatDataset, DataLoader
 from ..config import PretrainConfig
 from ..data import SyntheticEEGDataset, collate_variable_montage
 from ..jepa import EEGJepa
+from .checkpoint import save_checkpoint
+from .engine import PretrainTrainer
+from .utils import ema_at, lr_at, move, pick_device
 
-
-def pick_device(prefer: str = "auto") -> torch.device:
-    """Resolve a device. 'auto' picks cuda > mps > cpu.
-
-    Explicit choices ('cuda', 'cuda:1', 'mps', 'cpu') are honored but validated:
-    if the requested accelerator is unavailable we warn and fall back to cpu
-    instead of crashing mid-run.
-    """
-    def _available(kind: str) -> bool:
-        if kind == "cuda":
-            return torch.cuda.is_available()
-        if kind == "mps":
-            return getattr(torch.backends, "mps", None) is not None \
-                and torch.backends.mps.is_available()
-        return True  # cpu
-
-    if prefer == "auto":
-        if torch.cuda.is_available():
-            dev = torch.device("cuda")
-        elif _available("mps"):
-            dev = torch.device("mps")
-        else:
-            dev = torch.device("cpu")
-    else:
-        dev = torch.device(prefer)
-        if not _available(dev.type):
-            print(f"[device] {prefer!r} unavailable -> falling back to cpu")
-            dev = torch.device("cpu")
-
-    if dev.type == "cuda":
-        idx = dev.index or 0
-        print(f"[device] cuda:{idx} ({torch.cuda.get_device_name(idx)})")
-    else:
-        print(f"[device] {dev.type}")
-    return dev
+# Backward-compatible names used by external scripts.
+_lr_at = lr_at
+_ema_at = ema_at
 
 
 def build_pretrain_loader(cfg: PretrainConfig, n_sites: int = 4,
@@ -71,21 +41,6 @@ def build_pretrain_loader(cfg: PretrainConfig, n_sites: int = 4,
     )
 
 
-def _lr_at(step: int, total: int, warmup: int, base_lr: float) -> float:
-    if step < warmup:
-        return base_lr * (step + 1) / max(1, warmup)
-    t = (step - warmup) / max(1, total - warmup)
-    return 0.5 * base_lr * (1 + math.cos(math.pi * t))
-
-
-def _ema_at(step: int, total: int, base: float, final: float) -> float:
-    return base + (final - base) * (step / max(1, total))
-
-
-def move(batch: dict, device: torch.device) -> dict:
-    return {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-
-
 def pretrain(cfg: PretrainConfig, device: torch.device | None = None,
              n_sites: int = 4, per_site: int = 256, seconds: float = 4.0,
              verbose: bool = True) -> EEGJepa:
@@ -95,44 +50,8 @@ def pretrain(cfg: PretrainConfig, device: torch.device | None = None,
 
     loader = build_pretrain_loader(cfg, n_sites, per_site, seconds)
     model = EEGJepa(cfg).to(device)
-    gen = torch.Generator().manual_seed(cfg.seed)
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-    total_steps = cfg.epochs * len(loader)
-    warmup = cfg.warmup_epochs * len(loader)
-    step = 0
-    for epoch in range(cfg.epochs):
-        model.train()
-        run = 0.0
-        for batch in loader:
-            batch = move(batch, device)
-            lr = _lr_at(step, total_steps, warmup, cfg.lr)
-            for g in opt.param_groups:
-                g["lr"] = lr
-
-            out = model(batch, generator=gen)
-            loss = out["loss"]
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-            opt.step()
-            model.update_target(_ema_at(step, total_steps, cfg.ema_base, cfg.ema_final))
-
-            run += float(loss.detach())
-            if verbose and step % cfg.collapse_log_every == 0:
-                cs = model.collapse_report(out)
-                dom = f" dom={float(out['loss_domain']):.3f}" if "loss_domain" in out else ""
-                print(f"[ep {epoch:02d} step {step:05d}] lr={lr:.2e} "
-                      f"loss={float(loss):.4f}{dom} | {cs} "
-                      f"(ctx={out['n_context']} tgt={out['n_targets']})")
-                if cs.collapsed:
-                    print("  !! collapse warning: embedding variance/rank low")
-            step += 1
-        if verbose:
-            print(f"== epoch {epoch:02d} mean loss {run / len(loader):.4f} ==")
+    trainer = PretrainTrainer(model, cfg, device)
+    trainer.fit(loader.dataset, verbose=verbose)
     return model
 
 
@@ -161,7 +80,7 @@ def main() -> None:
 
     model = pretrain(cfg, device=pick_device(a.device),
                      n_sites=a.sites, per_site=a.per_site, seconds=a.seconds)
-    torch.save({"cfg": cfg, "state_dict": model.state_dict()}, a.save)
+    save_checkpoint(a.save, model, cfg)
     print(f"saved -> {a.save}")
 
 

@@ -7,7 +7,7 @@ probe and leave-one-SUBJECT-out evaluation use them.
   # quick: 3 subjects, pretrain on 2, probe held-out subject
   python scripts/train_moabb.py --subjects 1 2 3 --epochs 15
 
-  # cross-subject generalization (LODO over subjects)
+  # leave-one-subject-out SSL + within-subject calibration
   python scripts/train_moabb.py --subjects 1 2 3 4 --epochs 20 --lodo
 """
 
@@ -18,12 +18,10 @@ import torch
 from tseegjepa.config import PretrainConfig
 from tseegjepa.data.moabb_eeg import MoabbEEGDataset, load_moabb
 from tseegjepa.jepa import EEGJepa
+from tseegjepa.train.checkpoint import save_checkpoint
+from tseegjepa.train.engine import PretrainTrainer
 from tseegjepa.train.linear_probe import fit_linear_probe, fit_raw_baseline
-from tseegjepa.train.pretrain import (
-    _ema_at, _lr_at, move, pick_device,
-)
-from tseegjepa.data import collate_variable_montage
-from torch.utils.data import DataLoader
+from tseegjepa.train.pretrain import pick_device
 
 
 def build_cfg(args, n_subjects, n_classes) -> PretrainConfig:
@@ -43,34 +41,7 @@ def build_cfg(args, n_subjects, n_classes) -> PretrainConfig:
 
 
 def pretrain_on(model, ds, cfg, device, verbose=True):
-    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True,
-                        drop_last=True, collate_fn=collate_variable_montage)
-    params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    gen = torch.Generator().manual_seed(cfg.seed)
-    total = cfg.epochs * len(loader)
-    warm = cfg.warmup_epochs * len(loader)
-    step = 0
-    for ep in range(cfg.epochs):
-        model.train()
-        run = 0.0
-        for batch in loader:
-            batch = move(batch, device)
-            for g in opt.param_groups:
-                g["lr"] = _lr_at(step, total, warm, cfg.lr)
-            out = model(batch, generator=gen)
-            opt.zero_grad(set_to_none=True)
-            out["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(params, cfg.grad_clip)
-            opt.step()
-            model.update_target(_ema_at(step, total, cfg.ema_base, cfg.ema_final))
-            run += float(out["loss"].detach())
-            step += 1
-        if verbose:
-            cs = model.collapse_report(out)
-            v = f" var={float(out['loss_var']):.3f}" if "loss_var" in out else ""
-            cov = f" cov={float(out['loss_cov']):.3f}" if "loss_cov" in out else ""
-            print(f"  [pretrain ep{ep:02d}] loss={run/len(loader):.4f}{v}{cov} | {cs}")
+    PretrainTrainer(model, cfg, device).fit(ds, verbose=verbose)
     return model
 
 
@@ -81,6 +52,8 @@ def main():
     p.add_argument("--subjects", type=int, nargs="+", default=[1, 2, 3])
     p.add_argument("--n-classes", type=int, default=None)
     p.add_argument("--sample-rate", type=int, default=128)
+    p.add_argument("--bandpass", type=float, nargs=2, default=[0.5, 45.0],
+                   metavar=("LOW_HZ", "HIGH_HZ"))
     p.add_argument("--tmax", type=float, default=None, help="crop trial to N seconds")
     p.add_argument("--patch-ms", type=float, default=250.0)
     p.add_argument("--dim", type=int, default=128)
@@ -90,9 +63,8 @@ def main():
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--domain-inv", action="store_true")
     p.add_argument("--finetune", action="store_true")
-    p.add_argument("--pool", default="chan", choices=["mean", "chan"],
-                   help="downstream pooling: 'chan' keeps per-channel structure "
-                        "(better for motor imagery / lateralized tasks)")
+    p.add_argument("--pool", default="spatial", choices=["mean", "spatial", "chan"],
+                   help="spatial keeps scalp structure with a fixed feature size")
     p.add_argument("--norm", default="global", choices=["global", "perchan", "none"],
                    help="signal norm; 'global' preserves inter-channel band-power (MI)")
     p.add_argument("--subgroup", default="sex", choices=["sex", "age", "session"],
@@ -102,7 +74,8 @@ def main():
                         "is meaningful; pretrain still excludes held-out subject")
     p.add_argument("--raw-baseline", action="store_true",
                    help="also fit a log-bandpower baseline (no model) = achievable ceiling")
-    p.add_argument("--lodo", action="store_true", help="leave-one-subject-out loop")
+    p.add_argument("--lodo", action="store_true",
+                   help="leave one subject out of SSL, then calibrate on that subject")
     p.add_argument("--device", default="auto")
     p.add_argument("--save", default=None)
     args = p.parse_args()
@@ -112,6 +85,7 @@ def main():
     X, y, meta, ch_names, label_names = load_moabb(
         args.dataset, subjects=args.subjects, paradigm_name=args.paradigm,
         n_classes=args.n_classes, sample_rate=args.sample_rate, tmax=args.tmax,
+        fmin=args.bandpass[0], fmax=args.bandpass[1],
     )
     full = MoabbEEGDataset(X, y, meta, ch_names, norm=args.norm,
                            subgroup_by=args.subgroup)
@@ -144,7 +118,7 @@ def main():
         print("downstream:", {k_: v for k_, v in res.items() if k_ != "subgroup_accuracy"})
         print("subgroup acc:", res["subgroup_accuracy"])
         if args.save:
-            torch.save({"cfg": cfg, "state_dict": model.state_dict()}, args.save)
+            save_checkpoint(args.save, model, cfg, bandpass=list(args.bandpass))
             print("saved ->", args.save)
         return
 

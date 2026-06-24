@@ -200,6 +200,8 @@ def main():
     ap.add_argument("--paradigm", default="MotorImagery")
     ap.add_argument("--subjects", type=int, nargs="+", default=[1])
     ap.add_argument("--sample-rate", type=int, default=128)
+    ap.add_argument("--bandpass", type=float, nargs=2, default=[0.5, 45.0],
+                    metavar=("LOW_HZ", "HIGH_HZ"))
     ap.add_argument("--bands", nargs="+", default=["mu", "beta"], choices=list(BANDS))
     ap.add_argument("--out", default="figs")
     ap.add_argument("--tsne", action="store_true")
@@ -212,7 +214,7 @@ def main():
     print(f"loading {a.dataset} subjects={a.subjects} ...")
     X, y, meta, ch_names, label_names = load_moabb(
         a.dataset, subjects=a.subjects, paradigm_name=a.paradigm,
-        sample_rate=a.sample_rate,
+        sample_rate=a.sample_rate, fmin=a.bandpass[0], fmax=a.bandpass[1],
     )
     sr = a.sample_rate
     print(f"X={X.shape}  classes={label_names}")

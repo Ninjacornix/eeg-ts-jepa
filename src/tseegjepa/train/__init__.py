@@ -1,3 +1,3 @@
-from .pretrain import pretrain, build_pretrain_loader
+from .engine import EpochResult, PretrainTrainer
 
-__all__ = ["pretrain", "build_pretrain_loader"]
+__all__ = ["EpochResult", "PretrainTrainer"]

@@ -1,16 +1,8 @@
-"""Branch attention masks + multi-head attention.
+"""Factorized temporal and electrode-graph attention.
 
-Branches are realised as *structured attention patterns* over an arbitrary set
-of tokens, each token carrying a channel index and a time index:
-
-  * temporal branches (one per scale window `w`): a token attends only to
-    tokens on the SAME channel within +/- w time patches.  Different `w` give
-    short / medium / long temporal receptive fields.
-  * spatial branch: a token attends to tokens at the SAME time patch on ANY
-    channel (electrode-graph / channel attention).
-
-Because masks are derived from indices, they work for any montage and for any
-masked subset of tokens (I-JEPA-style gathered context/target sets).
+Attention is computed as ``C`` temporal sequences of length ``T`` plus ``T``
+spatial graphs of size ``C``. It therefore avoids materializing a dense
+``(C*T) x (C*T)`` mask.
 """
 
 from __future__ import annotations
@@ -20,41 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def build_branch_masks(
-    ch_index: torch.Tensor,     # (B, M)
-    time_index: torch.Tensor,   # (B, M)
-    token_mask: torch.Tensor,   # (B, M) True = valid
-    temporal_windows: tuple[int, ...],
-    use_spatial: bool,
-) -> list[torch.Tensor]:
-    """Return a list of boolean attn masks, each (B, 1, M, M); True = attend."""
-    same_ch = ch_index.unsqueeze(2) == ch_index.unsqueeze(1)      # (B,M,M)
-    same_t = time_index.unsqueeze(2) == time_index.unsqueeze(1)
-    dt = (time_index.unsqueeze(2) - time_index.unsqueeze(1)).abs()
-    valid_kv = token_mask.unsqueeze(1)                            # (B,1,M) over keys
-
-    masks: list[torch.Tensor] = []
-    for w in temporal_windows:
-        m = same_ch & (dt <= w)
-        m = m & valid_kv
-        masks.append(m.unsqueeze(1))
-    if use_spatial:
-        m = same_t & valid_kv
-        masks.append(m.unsqueeze(1))
-
-    # guard against all-False rows (a valid query with no valid keys) which would
-    # make softmax produce NaNs: let such a query attend to itself.
-    eye = torch.eye(ch_index.shape[1], dtype=torch.bool, device=ch_index.device)
-    eye = eye.view(1, 1, ch_index.shape[1], ch_index.shape[1])
-    fixed = []
-    for m in masks:
-        none_attended = ~m.any(dim=-1, keepdim=True)              # (B,1,M,1)
-        fixed.append(m | (none_attended & eye))
-    return fixed
-
-
 class BranchMHA(nn.Module):
-    """Standard MHA that consumes a precomputed boolean attention mask."""
+    """MHA over grouped temporal sequences or grouped spatial graphs."""
 
     def __init__(self, dim: int, heads: int, dropout: float = 0.0):
         super().__init__()
@@ -65,14 +24,67 @@ class BranchMHA(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        B, M, D = x.shape
-        qkv = self.qkv(x).reshape(B, M, 3, self.heads, self.dh)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4)           # each (B,H,M,dh)
-        # attn_mask: (B,1,M,M) bool -> broadcast over heads
+    def _attend(
+        self,
+        x: torch.Tensor,          # (G,L,D)
+        key_valid: torch.Tensor,  # (G,L)
+        pair_mask: torch.Tensor | None = None,  # (1|G,1,L,L)
+    ) -> torch.Tensor:
+        G, L, D = x.shape
+        original_valid = key_valid
+        key_valid = key_valid.clone()
+        empty = ~key_valid.any(-1)
+        if empty.any():
+            key_valid[empty, 0] = True
+        qkv = self.qkv(x).reshape(G, L, 3, self.heads, self.dh)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)
+        attn_mask = key_valid[:, None, None, :]
+        if pair_mask is not None:
+            attn_mask = attn_mask & pair_mask
+        if attn_mask.ndim == 4:
+            none = ~attn_mask.any(-1, keepdim=True)
+            if none.any():
+                eye = torch.eye(L, dtype=torch.bool, device=x.device)[None, None]
+                attn_mask = attn_mask | (none & eye)
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
         )
-        out = out.transpose(1, 2).reshape(B, M, D)
-        return self.proj(out)
+        out = self.proj(out.transpose(1, 2).reshape(G, L, D))
+        return out * original_valid.unsqueeze(-1)
+
+    def temporal(
+        self, x: torch.Tensor, valid: torch.Tensor, C: int, T: int, window: int
+    ) -> torch.Tensor:
+        B, _, D = x.shape
+        seq = x.reshape(B, C, T, D).reshape(B * C, T, D)
+        mask = valid.reshape(B, C, T).reshape(B * C, T)
+        ti = torch.arange(T, device=x.device)
+        local = ((ti[:, None] - ti[None, :]).abs() <= window)[None, None]
+        return self._attend(seq, mask, local).reshape(B, C * T, D)
+
+    def spatial(
+        self,
+        x: torch.Tensor,
+        valid: torch.Tensor,
+        ch_pos: torch.Tensor | None,
+        C: int,
+        T: int,
+        k_neighbors: int,
+    ) -> torch.Tensor:
+        B, _, D = x.shape
+        seq = x.reshape(B, C, T, D).permute(0, 2, 1, 3).reshape(B * T, C, D)
+        mask = valid.reshape(B, C, T).permute(0, 2, 1).reshape(B * T, C)
+        graph = None
+        if ch_pos is not None:
+            channel_valid = valid.reshape(B, C, T).any(-1)
+            dist = torch.cdist(ch_pos.float(), ch_pos.float())
+            dist = dist.masked_fill(~channel_valid[:, None, :], float("inf"))
+            k = min(C, k_neighbors)
+            nearest = dist.topk(k, largest=False).indices
+            graph_b = torch.zeros(B, C, C, dtype=torch.bool, device=x.device)
+            graph_b.scatter_(2, nearest, True)
+            graph_b &= channel_valid[:, None, :]
+            graph = graph_b[:, None].expand(B, T, C, C).reshape(B * T, 1, C, C)
+        out = self._attend(seq, mask, graph)
+        return out.reshape(B, T, C, D).permute(0, 2, 1, 3).reshape(B, C * T, D)

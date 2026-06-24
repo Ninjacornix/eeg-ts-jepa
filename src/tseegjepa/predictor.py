@@ -3,8 +3,8 @@
 Narrow transformer.  Input sequence = context tokens (their context-encoder
 representations) + mask tokens placed at every target position.  Both carry
 position/identity embeddings so the predictor knows *where* it is forecasting.
-Full self-attention (padding-masked); read-out at target positions is projected
-back to the encoder's latent dimension for the latent-space loss.
+Factorized temporal/spatial attention avoids a dense token-grid attention
+matrix; read-out at target positions is projected back to encoder dimension.
 """
 
 from __future__ import annotations
@@ -22,15 +22,34 @@ class _SelfAttn(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor, key_pad: torch.Tensor) -> torch.Tensor:
-        # key_pad: (B, M) True = valid key
-        B, M, D = x.shape
-        qkv = self.qkv(x).reshape(B, M, 3, self.heads, self.dh)
+    def _attend(self, x: torch.Tensor, key_pad: torch.Tensor) -> torch.Tensor:
+        G, M, D = x.shape
+        original = key_pad
+        key_pad = key_pad.clone()
+        empty = ~key_pad.any(-1)
+        if empty.any():
+            key_pad[empty, 0] = True
+        qkv = self.qkv(x).reshape(G, M, 3, self.heads, self.dh)
         q, k, v = qkv.permute(2, 0, 3, 1, 4)
-        attn_mask = key_pad.view(B, 1, 1, M).expand(B, self.heads, M, M)
+        attn_mask = key_pad.view(G, 1, 1, M)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        out = out.transpose(1, 2).reshape(B, M, D)
-        return self.proj(out)
+        out = self.proj(out.transpose(1, 2).reshape(G, M, D))
+        return out * original.unsqueeze(-1)
+
+    def forward(
+        self, x: torch.Tensor, key_pad: torch.Tensor, grid_shape: tuple[int, int]
+    ) -> torch.Tensor:
+        B, _, D = x.shape
+        C, T = grid_shape
+        temporal = x.reshape(B, C, T, D).reshape(B * C, T, D)
+        temporal_m = key_pad.reshape(B, C, T).reshape(B * C, T)
+        temporal = self._attend(temporal, temporal_m).reshape(B, C, T, D)
+
+        spatial = x.reshape(B, C, T, D).permute(0, 2, 1, 3).reshape(B * T, C, D)
+        spatial_m = key_pad.reshape(B, C, T).permute(0, 2, 1).reshape(B * T, C)
+        spatial = self._attend(spatial, spatial_m)
+        spatial = spatial.reshape(B, T, C, D).permute(0, 2, 1, 3)
+        return (temporal + spatial).reshape(B, C * T, D) * (2.0 ** -0.5)
 
 
 class _Block(nn.Module):
@@ -42,8 +61,8 @@ class _Block(nn.Module):
         h = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(nn.Linear(dim, h), nn.GELU(), nn.Linear(h, dim))
 
-    def forward(self, x, key_pad):
-        x = x + self.attn(self.n1(x), key_pad)
+    def forward(self, x, key_pad, grid_shape):
+        x = x + self.attn(self.n1(x), key_pad, grid_shape)
         x = x + self.mlp(self.n2(x))
         return x
 
@@ -65,6 +84,7 @@ class Predictor(nn.Module):
         pos_emb: torch.Tensor,        # (B, N, enc_dim) position/identity embeddings
         context_mask: torch.Tensor,   # (B, N) True = context token
         target_mask: torch.Tensor,    # (B, N) True = target token
+        grid_shape: tuple[int, int],
     ) -> torch.Tensor:
         """Return predicted target latents (B, N, enc_dim) (only target rows used)."""
         B, N, _ = context_repr.shape
@@ -79,6 +99,6 @@ class Predictor(nn.Module):
 
         key_pad = context_mask | target_mask          # valid tokens for attention
         for blk in self.blocks:
-            x = blk(x, key_pad)
+            x = blk(x, key_pad, grid_shape)
         x = self.norm(x)
         return self.out_proj(x)

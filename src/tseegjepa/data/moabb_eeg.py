@@ -44,11 +44,13 @@ def load_moabb(
     n_classes: int | None = None,
     sample_rate: int = 200,
     tmax: float | None = None,
+    fmin: float = 0.5,
+    fmax: float = 45.0,
 ):
     """Return (X, y, meta, ch_names, label_names).
 
-    X: float32 (n_trials, C, T) resampled to `sample_rate`.
-    y: int64 labels; meta: list of dicts with subject/session.
+    X: float32 (n_trials, C, T), explicitly bandpassed and resampled.
+    y: int64 labels; meta: list of dicts with subject/session/run.
     """
     _quiet()
     import moabb.datasets as ds_mod
@@ -58,10 +60,17 @@ def load_moabb(
     if subjects is not None:
         dataset.subject_list = subjects
 
+    if not 0 <= fmin < fmax < sample_rate / 2:
+        raise ValueError(
+            f"bandpass {fmin:g}-{fmax:g} Hz must lie below the "
+            f"{sample_rate / 2:g} Hz Nyquist frequency"
+        )
     if paradigm_name == "LeftRightImagery":
-        paradigm = LeftRightImagery(resample=sample_rate)
+        paradigm = LeftRightImagery(
+            resample=sample_rate, fmin=fmin, fmax=fmax
+        )
     else:
-        kw = {"resample": sample_rate}
+        kw = {"resample": sample_rate, "fmin": fmin, "fmax": fmax}
         if n_classes is not None:
             kw["n_classes"] = n_classes
         paradigm = MotorImagery(**kw)
@@ -80,8 +89,13 @@ def load_moabb(
     if tmax is not None:
         X = X[..., : int(tmax * sample_rate)]
 
-    # keep only channels present in the standard_1020 registry
-    keep = np.asarray(electrodes.known(ch_names), dtype=bool)
+    # Keep EEG sensors even when their names are outside standard_1020. Unknown
+    # identities use the shared fallback bucket instead of disappearing from the
+    # montage; known non-EEG channels such as EOG are excluded by channel type.
+    try:
+        keep = np.asarray([kind == "eeg" for kind in epochs.get_channel_types()])
+    except Exception:
+        keep = np.asarray(electrodes.known(ch_names), dtype=bool)
     if not keep.all():
         X = X[:, keep, :]
         ch_names = [n for n, k in zip(ch_names, keep) if k]
@@ -90,6 +104,7 @@ def load_moabb(
     meta_list = [
         {"subject": int(r["subject"]),
          "session": str(r["session"]),
+         "run": str(r.get("run", "")),
          **demo.get(int(r["subject"]), {})}
         for _, r in meta.iterrows()
     ]
@@ -99,7 +114,8 @@ def load_moabb(
 def subject_demographics(dataset, subjects: list[int]) -> dict[int, dict]:
     """Pull per-subject demographics.
 
-    Returns {subject: {"sex": "M"/"F"/"U", "age": int|None, "hand": str}}.
+    Returns per-subject metadata including sex, age, handedness, and collection
+    domain fields when the source table provides them.
     Two sources:
       1. a rich subject-info TABLE (e.g. Dreyer2023.get_subject_info(): columns
          SUJ_gender, Birth_year, ...) -> preferred, no EEG download needed;
@@ -163,7 +179,27 @@ def _demographics_from_table(dataset, subjects, ref_year: int = 2019):
         g = r.get("SUJ_gender")
         sex = sex_map.get(int(g), "U") if g is not None and not (
             isinstance(g, float) and math.isnan(g)) else "U"
-        out[s] = {"sex": sex, "age": age, "hand": "U"}
+        subdataset = r.get("SUBDATASET")
+        if subdataset is not None and not (
+            isinstance(subdataset, float) and math.isnan(subdataset)
+        ):
+            subdataset = str(subdataset)
+        else:
+            subdataset = None
+        exp_gender = r.get("EXP_gender")
+        experimenter_sex = (
+            sex_map.get(int(exp_gender), "U")
+            if exp_gender is not None
+            and not (isinstance(exp_gender, float) and math.isnan(exp_gender))
+            else "U"
+        )
+        out[s] = {
+            "sex": sex,
+            "age": age,
+            "hand": "U",
+            "subdataset": subdataset,
+            "experimenter_sex": experimenter_sex,
+        }
     return out
 
 
@@ -178,13 +214,16 @@ class MoabbEEGDataset(Dataset):
 
     def __init__(self, X, y, meta, ch_names, norm: str = "global",
                  subgroup_by: str = "sex", crop_t: int | None = None,
-                 crop_align: str = "end", standardize: bool | None = None):
+                 crop_align: str = "end", crop_jitter: int = 0,
+                 standardize: bool | None = None):
         self.X = X
         self.y = y
         self.meta = meta
         self.ch_names = ch_names
-        self.ch_ids = torch.from_numpy(electrodes.channel_ids(ch_names))
-        self.ch_pos = torch.from_numpy(electrodes.channel_positions(ch_names))
+        self.ch_ids = torch.from_numpy(electrodes.channel_ids(ch_names, strict=False))
+        self.ch_pos = torch.from_numpy(
+            electrodes.channel_positions(ch_names, strict=False)
+        )
         # back-compat: standardize=False -> "none"
         if standardize is False:
             norm = "none"
@@ -196,6 +235,7 @@ class MoabbEEGDataset(Dataset):
         # IV-2a [2,6] vs Dreyer [0,5]); 'start' = first; 'center' = middle.
         self.crop_t = crop_t
         self.crop_align = crop_align
+        self.crop_jitter = max(0, int(crop_jitter))
         subs = sorted({m["subject"] for m in meta})
         self._sub_lut = {s: i for i, s in enumerate(subs)}
         self._build_subgroups()
@@ -232,13 +272,19 @@ class MoabbEEGDataset(Dataset):
     def __getitem__(self, idx):
         x = torch.from_numpy(self.X[idx])                  # (C, T)
         if self.crop_t is not None and x.shape[1] > self.crop_t:
+            max_start = x.shape[1] - self.crop_t
             if self.crop_align == "end":
-                x = x[:, -self.crop_t:]
+                start = max_start
             elif self.crop_align == "center":
-                s = (x.shape[1] - self.crop_t) // 2
-                x = x[:, s:s + self.crop_t]
+                start = max_start // 2
             else:                                          # "start"
-                x = x[:, : self.crop_t]
+                start = 0
+            if self.crop_jitter:
+                lo = max(0, start - self.crop_jitter)
+                hi = min(max_start, start + self.crop_jitter)
+                if hi > lo:
+                    start = int(torch.randint(lo, hi + 1, ()).item())
+            x = x[:, start:start + self.crop_t]
         if self.norm == "global":
             x = (x - x.mean()) / (x.std() + 1e-8)          # keep inter-channel power
         elif self.norm == "perchan":
@@ -260,9 +306,16 @@ class MoabbEEGDataset(Dataset):
                                [self.meta[i] for i in idx],
                                self.ch_names, norm=self.norm,
                                subgroup_by=self.subgroup_by, crop_t=self.crop_t,
-                               crop_align=self.crop_align)
+                               crop_align=self.crop_align,
+                               crop_jitter=self.crop_jitter)
 
-    def with_crop(self, crop_t: int | None, crop_align: str = "end") -> "MoabbEEGDataset":
+    def with_crop(
+        self,
+        crop_t: int | None,
+        crop_align: str = "end",
+        crop_jitter: int = 0,
+    ) -> "MoabbEEGDataset":
         return MoabbEEGDataset(self.X, self.y, self.meta, self.ch_names,
                                norm=self.norm, subgroup_by=self.subgroup_by,
-                               crop_t=crop_t, crop_align=crop_align)
+                               crop_t=crop_t, crop_align=crop_align,
+                               crop_jitter=crop_jitter)

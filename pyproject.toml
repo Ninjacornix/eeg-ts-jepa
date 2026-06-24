@@ -11,7 +11,15 @@ dependencies = [
 
 [project.optional-dependencies]
 viz = ["matplotlib>=3.7"]
-moabb = ["moabb>=1.0", "mne>=1.5"]
+research = ["scipy>=1.10", "scikit-learn>=1.3", "pandas>=2.0"]
+moabb = [
+    "moabb>=1.0",
+    "mne>=1.5",
+    "scipy>=1.10",
+    "scikit-learn>=1.3",
+    "pandas>=2.0",
+]
+dev = ["pytest>=8", "ruff>=0.5", "mne>=1.5"]
 
 [project.scripts]
 tseegjepa-pretrain = "tseegjepa.train.pretrain:main"
@@ -24,3 +32,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
