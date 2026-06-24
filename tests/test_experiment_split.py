@@ -1,4 +1,19 @@
-from scripts.experiment import split_within
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+
+def _load_experiment_script():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "experiment.py"
+    spec = importlib.util.spec_from_file_location("experiment_script", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+split_within = _load_experiment_script().split_within
 
 
 def test_dreyer_subdataset_stratified_split_covers_every_domain():
